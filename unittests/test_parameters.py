@@ -345,3 +345,158 @@ def test_get_variant_nums():
 
     with pytest.raises(ValueError):
         MyTest.param_space.get_variant_nums(p=lambda x, y: x == 2)
+
+
+# Tests for bundled parameters
+
+
+class BundledParams(NoParams):
+    P0 = parameter(["a", "b"], bundle=True)
+    P1 = parameter([1, 2, 3], bundle=True)
+
+
+class MixedParams(NoParams):
+    # Non-bundled parameter creates separate variants
+    P0 = parameter(["x", "y"])
+    # Bundled parameters run in a loop within each job
+    P1 = parameter([1, 2], bundle=True)
+    P2 = parameter(["a", "b"], bundle=True)
+
+
+def test_bundled_param_is_bundled():
+    class MyTest(BundledParams):
+        pass
+
+    assert MyTest.param_space.has_bundled_params()
+    assert "P0" in MyTest.param_space.bundled_params
+    assert "P1" in MyTest.param_space.bundled_params
+
+
+def test_bundled_param_single_variant():
+    """Tests with only bundled params should have only 1 variant."""
+
+    class MyTest(BundledParams):
+        pass
+
+    # Only 1 variant since all params are bundled
+    assert len(MyTest.param_space) == 1
+    assert MyTest.num_variants == 1
+
+
+def test_bundled_param_combinations():
+    """Bundled combinations should contain all value combinations."""
+
+    class MyTest(BundledParams):
+        pass
+
+    combos = MyTest.param_space.bundled_combinations
+    # 2 values for P0 * 3 values for P1 = 6 combinations
+    assert len(combos) == 6
+
+
+def test_mixed_bundled_variants():
+    """Tests with mixed params should have variants for non-bundled only."""
+
+    class MyTest(MixedParams):
+        pass
+
+    # 2 variants from non-bundled P0 ('x' and 'y')
+    assert len(MyTest.param_space) == 2
+    assert MyTest.num_variants == 2
+
+    # But bundled combinations have 2*2=4 combinations
+    assert len(MyTest.param_space.bundled_combinations) == 4
+
+
+def test_bundled_param_instantiate():
+    """Bundled params should be initialized with first value."""
+
+    class MyTest(BundledParams):
+        pass
+
+    # Instantiate the single variant
+    test = MyTest(variant_num=0)
+
+    # Bundled params should be set to their first value
+    assert test.P0 == "a"
+    assert test.P1 == 1
+
+
+def test_mixed_bundled_instantiate():
+    """Non-bundled params vary per variant, bundled start at first value."""
+
+    class MyTest(MixedParams):
+        pass
+
+    # Variant 0: P0='x'
+    test0 = MyTest(variant_num=0)
+    assert test0.P0 == "x"
+    assert test0.P1 == 1  # First bundled value
+    assert test0.P2 == "a"  # First bundled value
+
+    # Variant 1: P0='y'
+    test1 = MyTest(variant_num=1)
+    assert test1.P0 == "y"
+    assert test1.P1 == 1  # First bundled value
+    assert test1.P2 == "a"  # First bundled value
+
+
+def test_bundled_parameters_property():
+    """Test the bundled_parameters property on test instances."""
+
+    class MyTest(BundledParams):
+        pass
+
+    test = MyTest(variant_num=0)
+    bundle_info = test.bundled_parameters
+
+    assert bundle_info["names"] == ["P0", "P1"]
+    assert len(bundle_info["combinations"]) == 6
+
+    # Check first combination
+    first = bundle_info["combinations"][0]
+    assert first["P0"] == "a"
+    assert first["P1"] == 1
+
+
+def test_has_bundled_params_method():
+    """Test the has_bundled_params method."""
+
+    class WithBundle(BundledParams):
+        pass
+
+    class WithoutBundle(TwoParams):
+        pass
+
+    test_with = WithBundle(variant_num=0)
+    test_without = WithoutBundle(variant_num=0)
+
+    assert test_with.has_bundled_params()
+    assert not test_without.has_bundled_params()
+
+
+def test_get_bundled_combination():
+    """Test getting a specific bundled combination."""
+
+    class MyTest(BundledParams):
+        pass
+
+    combo0 = MyTest.param_space.get_bundled_combination(0)
+    assert combo0 == {"P0": "a", "P1": 1}
+
+    combo5 = MyTest.param_space.get_bundled_combination(5)
+    assert combo5 == {"P0": "b", "P1": 3}
+
+
+def test_bundle_with_inheritance():
+    """Test that bundled parameters work with inheritance."""
+
+    class Base(NoParams):
+        P0 = parameter([1, 2], bundle=True)
+
+    class Derived(Base):
+        P1 = parameter(["a", "b"], bundle=True)
+
+    assert Derived.param_space.has_bundled_params()
+    assert len(Derived.param_space) == 1
+    assert len(Derived.param_space.bundled_combinations) == 4

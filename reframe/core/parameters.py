@@ -126,6 +126,12 @@ class TestParam:
 
     :returns: A new test parameter.
 
+    :param bundle: If :obj:`True`, this parameter is bundled with other
+        bundled parameters and all combinations are executed sequentially
+        within a single job allocation instead of generating separate jobs
+        for each combination. This is useful for parameter sweeps where the
+        scheduler overhead would dominate execution time.
+
     .. versionadded:: 3.10.0
        The ``fmt`` argument is added.
 
@@ -135,10 +141,13 @@ class TestParam:
     .. versionchanged:: 4.5
        Parameters are now loggable by default.
 
+    .. versionadded:: 4.X
+       The ``bundle`` argument is added.
+
     '''
 
     def __init__(self, values=None, *, type=None, inherit_params=False,
-                 filter_params=None, fmt=None, loggable=True):
+                 filter_params=None, fmt=None, loggable=True, bundle=False):
         if values is None:
             values = []
 
@@ -175,6 +184,7 @@ class TestParam:
 
         self.__fmt_fn = fmt
         self.__loggable = loggable
+        self.__bundle = bundle
         self.__type = type
         self.__owner = None
         self.__name = None
@@ -200,6 +210,11 @@ class TestParam:
     @property
     def format(self):
         return self.__fmt_fn
+
+    @property
+    def bundle(self):
+        '''Return whether this parameter is bundled.'''
+        return self.__bundle
 
     def update(self, other):
         '''Update this parameter from another one.
@@ -245,6 +260,10 @@ class ParamSpace(namespaces.Namespace):
     All the parameter combinations are stored under ``__param_combinations``.
     This enables random-access to any of the available parameter combinations
     through the ``__getitem__`` method.
+
+    Parameters marked with ``bundle=True`` are separated into
+    ``__bundled_combinations`` and are iterated within a single job instead
+    of generating separate test variants.
     '''
 
     def __init__(self, target_cls=None, illegal_names=None):
@@ -252,16 +271,48 @@ class ParamSpace(namespaces.Namespace):
                          ns_name='_rfm_param_space',
                          ns_local_name='_rfm_local_param_space')
 
-        # Store all param combinations to allow random access.
-        self.__param_combinations = tuple(
-            itertools.product(
-                *(copy.deepcopy(p.values) for p in self.params.values())
-            )
-        )
+        # Separate bundled and non-bundled parameters
+        self._bundled_params = {
+            name: p for name, p in self.params.items() if p.bundle
+        }
+        self._non_bundled_params = {
+            name: p for name, p in self.params.items() if not p.bundle
+        }
 
-        # Map the parameter names to the position they are stored in the
-        # parameter space
-        self._position = {name: idx for idx, name in enumerate(self.params)}
+        # Store all non-bundled param combinations for test variant generation
+        if self._non_bundled_params:
+            self.__param_combinations = tuple(
+                itertools.product(
+                    *(copy.deepcopy(p.values)
+                      for p in self._non_bundled_params.values())
+                )
+            )
+        else:
+            # If all params are bundled, we still need one variant
+            self.__param_combinations = ((),) if self.params else tuple(
+                itertools.product(
+                    *(copy.deepcopy(p.values) for p in self.params.values())
+                )
+            )
+
+        # Store bundled param combinations for iteration within jobs
+        if self._bundled_params:
+            self.__bundled_combinations = tuple(
+                itertools.product(
+                    *(copy.deepcopy(p.values)
+                      for p in self._bundled_params.values())
+                )
+            )
+        else:
+            self.__bundled_combinations = ()
+
+        # Map parameter names to positions (separate for bundled/non-bundled)
+        self._position = {
+            name: idx for idx, name in enumerate(self._non_bundled_params)
+        }
+        self._bundled_position = {
+            name: idx for idx, name in enumerate(self._bundled_params)
+        }
 
     def join(self, other, cls):
         '''Join other parameter space into the current one.
@@ -330,12 +381,15 @@ class ParamSpace(namespaces.Namespace):
         default value, the regression test parameters are initialized as
         None.
 
+        For bundled parameters, the first value is set initially. The test
+        framework will iterate over all bundled combinations during execution.
+
         :param obj: The test object.
         :param cls: The test class.
         :param params_index: index to a point in the parameter space.
         '''
-        # Set the values of the test parameters (if any)
-        if self.params and params_index is not None:
+        # Set the values of non-bundled test parameters (if any)
+        if self._non_bundled_params and params_index is not None:
             try:
                 # Get the parameter values for the specified variant
                 param_values = self.__param_combinations[params_index]
@@ -345,17 +399,69 @@ class ParamSpace(namespaces.Namespace):
                     f'{obj.__class__.__qualname__}'
                 ) from None
             else:
-                for index, key in enumerate(self.params):
+                for index, key in enumerate(self._non_bundled_params):
                     setattr(obj, key, param_values[index])
-
         else:
-            # Otherwise init the params as None
-            for key in self.params:
+            # Init non-bundled params as None
+            for key in self._non_bundled_params:
                 setattr(obj, key, None)
+
+        # Initialize bundled parameters with their first values
+        if self._bundled_params:
+            for name, param in self._bundled_params.items():
+                if param.values:
+                    setattr(obj, name, copy.deepcopy(param.values[0]))
+                else:
+                    setattr(obj, name, None)
+        else:
+            # Handle case where all params might be bundled but empty
+            for key in self.params:
+                if key not in self._non_bundled_params:
+                    setattr(obj, key, None)
 
     @property
     def params(self):
         return self._namespace
+
+    @property
+    def bundled_params(self):
+        '''Return the bundled parameters.'''
+        return self._bundled_params
+
+    @property
+    def non_bundled_params(self):
+        '''Return the non-bundled parameters.'''
+        return self._non_bundled_params
+
+    @property
+    def bundled_combinations(self):
+        '''Return all combinations of bundled parameters.
+
+        Each element is a tuple of values in the order of bundled_params.
+        '''
+        return self.__bundled_combinations
+
+    def has_bundled_params(self):
+        '''Return True if there are bundled parameters.'''
+        return bool(self._bundled_params)
+
+    def get_bundled_param_names(self):
+        '''Return the names of bundled parameters in order.'''
+        return list(self._bundled_params.keys())
+
+    def get_bundled_combination(self, index):
+        '''Get a bundled parameter combination by index.
+
+        Returns a dict mapping parameter names to values.
+        '''
+        if not self.__bundled_combinations:
+            return {}
+
+        values = self.__bundled_combinations[index]
+        return {
+            name: values[i]
+            for i, name in enumerate(self._bundled_params)
+        }
 
     def defines(self, name):
         '''Return True if parameter is defined.
@@ -381,20 +487,30 @@ class ParamSpace(namespaces.Namespace):
         yield from self.__param_combinations
 
     def __len__(self):
-        '''Returns the number of all possible parameter combinations.
+        '''Returns the number of test variants (non-bundled parameter combinations).
 
         Method to calculate the test's parameter space length (i.e. the number
-        of all possible parameter combinations). If the RegressionTest
-        has no parameters, the length is 1.
+        of test variants to generate). Bundled parameters do not create
+        separate variants - they are iterated within each job.
+
+        If the RegressionTest has no non-bundled parameters, the length is 1.
 
         .. note::
            If the test is an abstract test (i.e. has undefined parameters in
            the parameter space), the returned parameter space length is 0.
 
-        :return: length of the parameter space
+        :return: length of the parameter space (number of variants)
 
         '''
-        if not self.params:
+        if not self._non_bundled_params and not self._bundled_params:
+            return 1
+
+        # If all params are bundled, we still have 1 variant
+        if not self._non_bundled_params:
+            # Check if any bundled param is abstract
+            for p in self._bundled_params.values():
+                if p.is_abstract():
+                    return 0
             return 1
 
         return len(self.__param_combinations)
@@ -403,10 +519,10 @@ class ParamSpace(namespaces.Namespace):
         '''Access an element in the parameter space.
 
         If the key is an integer, this will be interpreted as a point in the
-        parameter space and this function will return a mapping of the
-        parameter names and their corresponding values. If the key is a
-        parameter name, it will instead return all the values assigned to that
-        parameter.
+        non-bundled parameter space and this function will return a mapping of
+        the non-bundled parameter names and their corresponding values.
+        If the key is a parameter name, it will instead return all the values
+        assigned to that parameter.
 
         If the key is an integer, this function will raise an
         :class:`IndexError` if the key is out of bounds.
@@ -415,7 +531,7 @@ class ParamSpace(namespaces.Namespace):
         if isinstance(key, int):
             ret = {}
             val = self.__param_combinations[key]
-            for i, name in enumerate(self.params):
+            for i, name in enumerate(self._non_bundled_params):
                 ret[name] = val[i]
 
             return ret
@@ -472,7 +588,13 @@ class ParamSpace(namespaces.Namespace):
     def _get_param_value(self, name, variant):
         '''Get the a parameter's value for a given variant.
 
-        In this context, a variant is a point in the parameter space.
-        The name argument is simply the parameter name
+        In this context, a variant is a point in the non-bundled parameter
+        space. The name argument is simply the parameter name.
+
+        For bundled parameters, this returns None since bundled parameters
+        don't have variant-specific values (they are iterated within each job).
         '''
+        if name in self._bundled_params:
+            # Bundled parameters don't have variant-specific values
+            return None
         return self.__param_combinations[variant][self._position[name]]

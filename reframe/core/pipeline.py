@@ -17,6 +17,7 @@ import glob
 import hashlib
 import inspect
 import itertools
+import json
 import numbers
 import os
 import shutil
@@ -1489,6 +1490,95 @@ class RegressionTest(RegressionTestPlugin, jsonext.JSONSerializable):
         '''
         return getattr(self, '_rfm_fixt_variant', None)
 
+    @property
+    def bundled_parameters(self):
+        '''Return information about bundled parameters.
+
+        :returns: A dictionary with:
+            - 'names': List of bundled parameter names
+            - 'combinations': List of dicts mapping param names to values
+
+        .. versionadded:: 4.X
+        '''
+        param_space = type(self)._rfm_param_space
+        if not param_space.has_bundled_params():
+            return {'names': [], 'combinations': []}
+
+        names = param_space.get_bundled_param_names()
+        combinations = []
+        for i in range(len(param_space.bundled_combinations)):
+            combinations.append(param_space.get_bundled_combination(i))
+
+        return {'names': names, 'combinations': combinations}
+
+    def has_bundled_params(self):
+        '''Check if this test has bundled parameters.
+
+        .. versionadded:: 4.X
+        '''
+        return type(self)._rfm_param_space.has_bundled_params()
+
+    def get_bundle_iteration_output(self, iteration, output=None):
+        '''Extract the output for a specific bundle iteration.
+
+        When using bundled parameters, the job output contains markers
+        for each iteration. This method extracts the output for a specific
+        iteration.
+
+        :param iteration: The iteration index (0-based).
+        :param output: The full output string. If None, uses self.stdout.
+        :returns: The output for the specified iteration.
+
+        .. versionadded:: 4.X
+        '''
+        if output is None:
+            output = self.stdout
+
+        start_marker = f'=== REFRAME BUNDLE ITERATION {iteration} ==='
+        end_marker = f'=== REFRAME BUNDLE ITERATION {iteration} END ==='
+
+        lines = output.split('\n') if isinstance(output, str) else output
+        in_section = False
+        result_lines = []
+
+        for line in lines:
+            if start_marker in line:
+                in_section = True
+                continue
+            elif end_marker in line:
+                break
+            elif in_section:
+                result_lines.append(line)
+
+        return '\n'.join(result_lines)
+
+    def iter_bundle_outputs(self, output=None):
+        '''Iterate over all bundle iteration outputs.
+
+        Yields tuples of (iteration_index, parameters_dict, output_string)
+        for each bundle iteration.
+
+        :param output: The full output string. If None, uses self.stdout.
+        :yields: Tuples of (index, params, output).
+
+        Example usage in a performance function::
+
+            for idx, params, out in self.iter_bundle_outputs():
+                size = params['message_size']
+                perf = extract_perf(out)
+                self.perf_variables[f'bandwidth_{size}'] = (
+                    sn.make_performance_function(lambda: perf, 'MB/s')
+                )
+
+        .. versionadded:: 4.X
+        '''
+        bundle_info = self.bundled_parameters
+        combinations = bundle_info['combinations']
+
+        for i, params in enumerate(combinations):
+            iter_output = self.get_bundle_iteration_output(i, output)
+            yield i, params, iter_output
+
     def set_var_default(self, name, value):
         '''Set the default value of a variable if variable is undefined.
 
@@ -2171,12 +2261,23 @@ class RegressionTest(RegressionTestPlugin, jsonext.JSONSerializable):
         else:
             prepare_cmds = []
 
-        commands = [
-            *prepare_cmds,
+        # Generate commands, possibly wrapped in a bundle loop
+        run_commands = [
             *self.prerun_cmds,
             ' '.join(exec_cmd).strip(),
             *self.postrun_cmds
         ]
+
+        if self.has_bundled_params():
+            commands = [
+                *prepare_cmds,
+                *self._generate_bundle_loop(run_commands)
+            ]
+        else:
+            commands = [
+                *prepare_cmds,
+                *run_commands
+            ]
         user_environ = Environment(self.unique_name,
                                    self.modules, self.env_vars.items())
         environs = [
@@ -2223,6 +2324,84 @@ class RegressionTest(RegressionTestPlugin, jsonext.JSONSerializable):
         # Update num_tasks if test is flexible
         if self.job.sched_flex_alloc_nodes:
             self.num_tasks = self.job.num_tasks
+
+    def _generate_bundle_loop(self, run_commands):
+        '''Generate shell commands that loop over bundled parameter combinations.
+
+        This method creates a shell loop that iterates over all bundled
+        parameter values, setting environment variables for each combination
+        and running the test commands.
+
+        :param run_commands: The list of commands to run for each iteration.
+        :returns: A list of shell commands implementing the loop.
+
+        .. versionadded:: 4.X
+        '''
+        bundle_info = self.bundled_parameters
+        param_names = bundle_info['names']
+        combinations = bundle_info['combinations']
+
+        if not combinations:
+            return run_commands
+
+        # Write combinations to a file that the shell script will read
+        import json
+        bundle_file = os.path.join(self._stagedir, '.rfm_bundle_params.json')
+        with open(bundle_file, 'w') as f:
+            json.dump({'names': param_names, 'combinations': combinations}, f)
+
+        # Generate shell loop that reads the bundle file
+        loop_commands = []
+
+        # Start marker for bundled execution
+        loop_commands.append('echo "=== REFRAME BUNDLED EXECUTION START ==="')
+
+        # Store combinations in bash arrays for iteration
+        num_combinations = len(combinations)
+        loop_commands.append(f'_rfm_bundle_count={num_combinations}')
+
+        # Create a loop that iterates over combination indices
+        loop_start = 'for _rfm_bundle_idx in $(seq 0 $((_rfm_bundle_count - 1))); do'
+        loop_commands.append(loop_start)
+
+        # Print bundle iteration marker
+        loop_commands.append('  echo "=== REFRAME BUNDLE ITERATION $_rfm_bundle_idx ==="')
+
+        # Export environment variables for each parameter
+        # We use a Python helper to read the JSON and set env vars
+        for i, name in enumerate(param_names):
+            # Create bash arrays with all values for each parameter
+            values_str = ' '.join(
+                f'"{self._shell_escape(str(c[name]))}"'
+                for c in combinations
+            )
+            loop_commands.insert(
+                len(loop_commands) - 2,  # Before the loop
+                f'_rfm_bundle_{name}=({values_str})'
+            )
+            # Inside the loop, export the value
+            loop_commands.append(
+                f'  export RFM_BUNDLE_{name.upper()}="${{_rfm_bundle_{name}[$_rfm_bundle_idx]}}"'
+            )
+
+        # Add the run commands, indented for the loop
+        for cmd in run_commands:
+            loop_commands.append(f'  {cmd}')
+
+        # Print iteration end marker
+        loop_commands.append('  echo "=== REFRAME BUNDLE ITERATION $_rfm_bundle_idx END ==="')
+
+        # End the loop
+        loop_commands.append('done')
+
+        # End marker for bundled execution
+        loop_commands.append('echo "=== REFRAME BUNDLED EXECUTION END ==="')
+
+        return loop_commands
+
+    def _shell_escape(self, s):
+        '''Escape a string for safe inclusion in shell scripts.'''
+        return s.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$')
 
     def _map_resources_to_jobopts(self):
         resources_opts = []
