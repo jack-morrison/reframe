@@ -25,11 +25,12 @@ class BundledParamTest(rfm.RunOnlyRegressionTest):
     @run_before("run")
     def set_exec_opts(self):
         # Access the bundled parameter values via environment variables
-        # RFM_BUNDLE_MESSAGE_SIZE and RFM_BUNDLE_PRECISION
+        # Environment vars are named <TESTNAME>_<PARAM>, e.g.:
+        # BUNDLEDPARAMTEST_MESSAGE_SIZE and BUNDLEDPARAMTEST_PRECISION
         self.executable_opts = [
             f"backend={self.backend}",
-            "size=$RFM_BUNDLE_MESSAGE_SIZE",
-            "precision=$RFM_BUNDLE_PRECISION",
+            "size=$BUNDLEDPARAMTEST_MESSAGE_SIZE",
+            "precision=$BUNDLEDPARAMTEST_PRECISION",
         ]
 
     @sanity_function
@@ -73,7 +74,8 @@ class SimpleBundledTest(rfm.RunOnlyRegressionTest):
 
     @run_before("run")
     def set_exec_opts(self):
-        self.executable_opts = ["value=$RFM_BUNDLE_VALUE"]
+        # Env var is SIMPLEBUNDLEDTEST_VALUE
+        self.executable_opts = ["value=$SIMPLEBUNDLEDTEST_VALUE"]
 
     @sanity_function
     def validate(self):
@@ -99,7 +101,8 @@ class MixedParamTest(rfm.RunOnlyRegressionTest):
 
     @run_before("run")
     def set_exec_opts(self):
-        self.executable_opts = [f"mode={self.mode}", "iter=$RFM_BUNDLE_ITERATION"]
+        # Env var is MIXEDPARAMTEST_ITERATION
+        self.executable_opts = [f"mode={self.mode}", "iter=$MIXEDPARAMTEST_ITERATION"]
 
     @sanity_function
     def validate(self):

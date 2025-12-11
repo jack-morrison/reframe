@@ -2326,14 +2326,14 @@ class RegressionTest(RegressionTestPlugin, jsonext.JSONSerializable):
             self.num_tasks = self.job.num_tasks
 
     def _generate_bundle_loop(self, run_commands):
-        '''Generate shell commands that loop over bundled parameter combinations.
+        '''Generate shell commands for bundled parameter combinations.
 
-        This method creates a shell loop that iterates over all bundled
-        parameter values, setting environment variables for each combination
-        and running the test commands.
+        This method unrolls all bundled parameter combinations, generating
+        explicit commands for each combination. This makes the job script
+        more readable and obvious about what's happening.
 
         :param run_commands: The list of commands to run for each iteration.
-        :returns: A list of shell commands implementing the loop.
+        :returns: A list of shell commands with unrolled iterations.
 
         .. versionadded:: 4.X
         '''
@@ -2344,60 +2344,56 @@ class RegressionTest(RegressionTestPlugin, jsonext.JSONSerializable):
         if not combinations:
             return run_commands
 
-        # Write combinations to a file that the shell script will read
-        import json
+        # Write combinations to a file for later reference
         bundle_file = os.path.join(self._stagedir, '.rfm_bundle_params.json')
         with open(bundle_file, 'w') as f:
             json.dump({'names': param_names, 'combinations': combinations}, f)
 
-        # Generate shell loop that reads the bundle file
-        loop_commands = []
+        # Create env var prefix from test name (sanitized for shell)
+        env_prefix = self._sanitize_basename(self.short_name).upper()
+
+        # Unroll all combinations explicitly
+        unrolled_commands = []
 
         # Start marker for bundled execution
-        loop_commands.append('echo "=== REFRAME BUNDLED EXECUTION START ==="')
+        unrolled_commands.append('echo "=== REFRAME BUNDLED EXECUTION START ==="')
 
-        # Store combinations in bash arrays for iteration
-        num_combinations = len(combinations)
-        loop_commands.append(f'_rfm_bundle_count={num_combinations}')
+        for idx, combo in enumerate(combinations):
+            # Iteration start marker
+            unrolled_commands.append(f'echo "=== REFRAME BUNDLE ITERATION {idx} ==="')
 
-        # Create a loop that iterates over combination indices
-        loop_start = 'for _rfm_bundle_idx in $(seq 0 $((_rfm_bundle_count - 1))); do'
-        loop_commands.append(loop_start)
+            # Export environment variables for this combination
+            for name in param_names:
+                value = self._shell_escape(str(combo[name]))
+                unrolled_commands.append(
+                    f'export {env_prefix}_{name.upper()}="{value}"'
+                )
 
-        # Print bundle iteration marker
-        loop_commands.append('  echo "=== REFRAME BUNDLE ITERATION $_rfm_bundle_idx ==="')
+            # Add the run commands
+            for cmd in run_commands:
+                unrolled_commands.append(cmd)
 
-        # Export environment variables for each parameter
-        # We use a Python helper to read the JSON and set env vars
-        for i, name in enumerate(param_names):
-            # Create bash arrays with all values for each parameter
-            values_str = ' '.join(
-                f'"{self._shell_escape(str(c[name]))}"'
-                for c in combinations
-            )
-            loop_commands.insert(
-                len(loop_commands) - 2,  # Before the loop
-                f'_rfm_bundle_{name}=({values_str})'
-            )
-            # Inside the loop, export the value
-            loop_commands.append(
-                f'  export RFM_BUNDLE_{name.upper()}="${{_rfm_bundle_{name}[$_rfm_bundle_idx]}}"'
-            )
-
-        # Add the run commands, indented for the loop
-        for cmd in run_commands:
-            loop_commands.append(f'  {cmd}')
-
-        # Print iteration end marker
-        loop_commands.append('  echo "=== REFRAME BUNDLE ITERATION $_rfm_bundle_idx END ==="')
-
-        # End the loop
-        loop_commands.append('done')
+            # Iteration end marker
+            unrolled_commands.append(f'echo "=== REFRAME BUNDLE ITERATION {idx} END ==="')
 
         # End marker for bundled execution
-        loop_commands.append('echo "=== REFRAME BUNDLED EXECUTION END ==="')
+        unrolled_commands.append('echo "=== REFRAME BUNDLED EXECUTION END ==="')
 
-        return loop_commands
+        return unrolled_commands
+
+    def _sanitize_basename(self, name):
+        '''Sanitize a name for use as a shell variable prefix.
+
+        Replaces invalid characters with underscores and ensures the name
+        starts with a letter or underscore.
+        '''
+        import re
+        # Replace any non-alphanumeric characters with underscores
+        sanitized = re.sub(r'[^a-zA-Z0-9]', '_', name)
+        # Ensure it starts with a letter or underscore
+        if sanitized and sanitized[0].isdigit():
+            sanitized = '_' + sanitized
+        return sanitized
 
     def _shell_escape(self, s):
         '''Escape a string for safe inclusion in shell scripts.'''
